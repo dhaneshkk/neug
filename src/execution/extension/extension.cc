@@ -101,6 +101,11 @@ static inline int dlclose(void* handle) {
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#ifndef _WIN32
+#include <pwd.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -172,6 +177,65 @@ static std::string getEnvVarFromWin32(const char* name) {
 }
 #endif
 
+// Extension names become directory names and file names, so only accept a
+// conservative identifier alphabet. This rejects "..", path separators, NUL,
+// drive prefixes and anything else that could escape the extension root.
+static bool isValidExtensionName(const std::string& name) {
+  if (name.empty() || name.size() > 64) {
+    return false;
+  }
+  for (unsigned char c : name) {
+    const bool ok =
+        (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static Status validateExtensionName(const std::string& name) {
+  if (!isValidExtensionName(name)) {
+    return Status(StatusCode::ERR_INVALID_ARGUMENT,
+                  "Invalid extension name '" + name +
+                      "': names must be 1-64 characters of [a-z0-9_]");
+  }
+  return Status::OK();
+}
+
+static bool envFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr &&
+         (std::string(value) == "1" || std::string(value) == "true" ||
+          std::string(value) == "TRUE");
+}
+
+// Per-user default extension home. The previous fallback was the
+// world-writable /tmp, which let any local user plant a library that a later
+// LOAD (or auto_load_extension) would execute in the database process.
+static std::string getDefaultExtensionBase() {
+#ifdef _WIN32
+  std::string base = getEnvVarFromWin32("LOCALAPPDATA");
+  if (!base.empty()) {
+    return base + "\\neug";
+  }
+  return std::string();
+#else
+  const char* xdg = std::getenv("XDG_DATA_HOME");
+  if (xdg && *xdg && xdg[0] == '/') {
+    return std::string(xdg) + "/neug";
+  }
+  const char* home = std::getenv("HOME");
+  if (home && *home) {
+    return std::string(home) + "/.neug";
+  }
+  if (const passwd* pw = ::getpwuid(::geteuid()); pw && pw->pw_dir) {
+    return std::string(pw->pw_dir) + "/.neug";
+  }
+  return std::string();
+#endif
+}
+
 static std::string getExtensionRootDir() {
   std::string base;
 #ifdef _WIN32
@@ -188,13 +252,111 @@ static std::string getExtensionRootDir() {
   }
 #endif
   if (base.empty()) {
-    base = "/tmp";
+    base = getDefaultExtensionBase();
+  }
+  if (base.empty()) {
+    THROW_IO_EXCEPTION(
+        "Cannot determine a per-user extension directory; set "
+        "NEUG_EXTENSION_HOME_PYENV");
   }
   return base + "/extension";
 }
 
 static std::string getUserExtensionDir(const std::string& extension_name) {
   return getExtensionRootDir() + "/" + extension_name;
+}
+
+// True when `path` resolves to a location strictly inside `root`.
+static bool isPathWithinRoot(const std::filesystem::path& root,
+                             const std::filesystem::path& path) {
+  std::error_code ec;
+  const auto canonical_root = std::filesystem::weakly_canonical(root, ec);
+  if (ec) {
+    return false;
+  }
+  const auto canonical_path = std::filesystem::weakly_canonical(path, ec);
+  if (ec) {
+    return false;
+  }
+  const auto rel = canonical_path.lexically_relative(canonical_root);
+  if (rel.empty() || rel == ".") {
+    return false;
+  }
+  const auto first = *rel.begin();
+  return first != ".." && !rel.is_absolute();
+}
+
+// Refuse to dlopen code that another local user could have written. The file,
+// its directory and the extension root must be owned by the current user (or
+// root) and must not be group/world-writable.
+// NEUG_EXTENSION_ALLOW_INSECURE_PERMS=1 opts out for shared environments that
+// rely on group-writable installs.
+static Status checkTrustedExtensionPath(const std::filesystem::path& root,
+                                        const std::filesystem::path& library) {
+#ifdef _WIN32
+  (void) root;
+  (void) library;
+  return Status::OK();
+#else
+  if (envFlagEnabled("NEUG_EXTENSION_ALLOW_INSECURE_PERMS")) {
+    return Status::OK();
+  }
+  const uid_t me = ::geteuid();
+  for (const auto& p : {library, library.parent_path(), root}) {
+    struct stat st {};
+    if (::stat(p.c_str(), &st) != 0) {
+      return Status(StatusCode::ERR_IO_ERROR,
+                    "Cannot stat extension path: " + p.string());
+    }
+    if (st.st_uid != me && st.st_uid != 0) {
+      return Status(StatusCode::ERR_PERMISSION,
+                    "Refusing to load extension: " + p.string() +
+                        " is owned by another user");
+    }
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+      return Status(StatusCode::ERR_PERMISSION,
+                    "Refusing to load extension: " + p.string() +
+                        " is group- or world-writable (set "
+                        "NEUG_EXTENSION_ALLOW_INSECURE_PERMS=1 to override)");
+    }
+  }
+  return Status::OK();
+#endif
+}
+
+// Only the official repository is trusted by default. Additional HTTPS
+// repositories must be listed (comma-separated URL prefixes) in
+// NEUG_EXTENSION_REPO_ALLOWLIST by whoever controls the server process, so a
+// query alone can no longer make the database download and run foreign code.
+static Status checkRepositoryAllowed(const std::string& repo) {
+  if (repo == neug::extension::ExtensionUtils::OFFICIAL_EXTENSION_REPO) {
+    return Status::OK();
+  }
+  if (repo.rfind("https://", 0) != 0) {
+    return Status(StatusCode::ERR_PERMISSION,
+                  "Extension repository must use https://: " + repo);
+  }
+  if (repo.find('{') != std::string::npos ||
+      repo.find('}') != std::string::npos) {
+    return Status(StatusCode::ERR_INVALID_ARGUMENT,
+                  "Extension repository URL must not contain braces: " + repo);
+  }
+  const char* allow = std::getenv("NEUG_EXTENSION_REPO_ALLOWLIST");
+  if (allow != nullptr) {
+    std::stringstream ss(allow);
+    std::string prefix;
+    while (std::getline(ss, prefix, ',')) {
+      prefix.erase(0, prefix.find_first_not_of(" \t"));
+      prefix.erase(prefix.find_last_not_of(" \t") + 1);
+      if (!prefix.empty() && repo.rfind(prefix, 0) == 0) {
+        return Status::OK();
+      }
+    }
+  }
+  return Status(StatusCode::ERR_PERMISSION,
+                "Extension repository is not allowed: " + repo +
+                    ". Add its URL prefix to NEUG_EXTENSION_REPO_ALLOWLIST on "
+                    "the database host to permit it.");
 }
 
 // Promote libneug.so to RTLD_GLOBAL so that extensions loaded via dlopen
@@ -321,6 +483,13 @@ static void trySetCaCertPaths(httplib::SSLClient& cli) {
 Status install_extension(const std::string& extension_name,
                          const std::string& repository) {
   LOG(INFO) << "[Admin] INSTALL extension: " << extension_name;
+  RETURN_IF_NOT_OK(validateExtensionName(extension_name));
+  const std::string& requested_repo =
+      repository.empty()
+          ? std::string(
+                neug::extension::ExtensionUtils::OFFICIAL_EXTENSION_REPO)
+          : repository;
+  RETURN_IF_NOT_OK(checkRepositoryAllowed(requested_repo));
   std::string extDir = getUserExtensionDir(extension_name);
 
   std::error_code ec;
@@ -330,17 +499,18 @@ Status install_extension(const std::string& extension_name,
                   "Failed to create extension directory: " + extDir +
                       " ec=" + ec.message());
   }
+#ifndef _WIN32
+  // Keep the per-user extension tree private to its owner.
+  ::chmod(getExtensionRootDir().c_str(), 0700);
+  ::chmod(extDir.c_str(), 0700);
+#endif
 
   auto fileName =
       neug::extension::ExtensionUtils::getExtensionFileName(extension_name);
   auto localLibPath = extDir + "/" + fileName;
 
-  const std::string& repo =
-      repository.empty()
-          ? neug::extension::ExtensionUtils::OFFICIAL_EXTENSION_REPO
-          : repository;
   auto repoInfo = neug::extension::ExtensionUtils::getExtensionLibRepoInfo(
-      extension_name, repo);
+      extension_name, requested_repo);
 
   LOG(INFO) << "[Admin] Download URL host=" << repoInfo.hostURL
             << " path=" << repoInfo.hostPath << " full=" << repoInfo.repoURL;
@@ -367,23 +537,45 @@ Status install_extension(const std::string& extension_name,
   }
 
   if (!std::filesystem::exists(localLibPath)) {
-    auto st = downloadExtensionFile(repoInfo, localLibPath);
+    // Download to a private temporary name and publish it with an atomic
+    // rename only after the checksum matches, so a concurrent LOAD (or a
+    // crash) can never observe an unverified or partially written library.
+#ifndef _WIN32
+    const std::string tmpPath =
+        localLibPath + ".download." + std::to_string(::getpid());
+#else
+    const std::string tmpPath = localLibPath + ".download";
+#endif
+    std::error_code rm_ec;
+    std::filesystem::remove(tmpPath, rm_ec);
+    auto st = downloadExtensionFile(repoInfo, tmpPath);
     if (!st.ok()) {
+      std::filesystem::remove(tmpPath, rm_ec);
       return Status(StatusCode::ERR_IO_ERROR,
                     "Failed to download extension " + extension_name +
                         " to local lib path " + localLibPath + " : " +
                         st.error_message());
     }
-    LOG(INFO) << "[Admin] Extension " << extension_name << " downloaded to "
-              << localLibPath;
-    auto verifySt = verifyExtensionChecksum(repoInfo, localLibPath);
+    auto verifySt = verifyExtensionChecksum(repoInfo, tmpPath);
     if (!verifySt.ok()) {
-      std::filesystem::remove(localLibPath);
+      std::filesystem::remove(tmpPath, rm_ec);
       return Status(
           StatusCode::ERR_IO_ERROR,
           "Extension integrity check failed: " + verifySt.error_message());
     }
-    LOG(INFO) << "[Admin] Extension integrity verified for " << extension_name;
+#ifndef _WIN32
+    ::chmod(tmpPath.c_str(), 0600);
+#endif
+    std::error_code mv_ec;
+    std::filesystem::rename(tmpPath, localLibPath, mv_ec);
+    if (mv_ec) {
+      std::filesystem::remove(tmpPath, rm_ec);
+      return Status(StatusCode::ERR_IO_ERROR, "Failed to publish extension " +
+                                                  localLibPath + ": " +
+                                                  mv_ec.message());
+    }
+    LOG(INFO) << "[Admin] Extension " << extension_name
+              << " downloaded, verified and installed to " << localLibPath;
   }
 
   return Status::OK();
@@ -417,16 +609,15 @@ static Status downloadExtensionFile(const ExtensionRepoInfo& repoInfo,
       if (verify_result != 0) {
         const char* verify_error_str =
             X509_verify_cert_error_string(verify_result);
-        LOG(ERROR) << "[Admin] SSL verification failed: "
-                   << "error_code=" << verify_result << ", error_description=\""
+        LOG(ERROR) << "[Admin] SSL verification failed: " << "error_code="
+                   << verify_result << ", error_description=\""
                    << (verify_error_str ? verify_error_str : "unknown")
                    << "\", host=" << repoInfo.hostURL;
 
         // Log CA certificate paths for debugging
         const char* ssl_cert_file = std::getenv("SSL_CERT_FILE");
         const char* ssl_cert_dir = std::getenv("SSL_CERT_DIR");
-        LOG(ERROR) << "[Admin] CA certificate paths: "
-                   << "SSL_CERT_FILE="
+        LOG(ERROR) << "[Admin] CA certificate paths: " << "SSL_CERT_FILE="
                    << (ssl_cert_file ? ssl_cert_file
                                      : "not set (using default)")
                    << ", SSL_CERT_DIR="
@@ -538,16 +729,15 @@ static Status verifyExtensionChecksum(const ExtensionRepoInfo& libRepoInfo,
       if (verify_result != 0) {
         const char* verify_error_str =
             X509_verify_cert_error_string(verify_result);
-        LOG(ERROR) << "[Admin] SSL verification failed: "
-                   << "error_code=" << verify_result << ", error_description=\""
+        LOG(ERROR) << "[Admin] SSL verification failed: " << "error_code="
+                   << verify_result << ", error_description=\""
                    << (verify_error_str ? verify_error_str : "unknown")
                    << "\", host=" << checksumHost;
 
         // Log CA certificate paths for debugging
         const char* ssl_cert_file = std::getenv("SSL_CERT_FILE");
         const char* ssl_cert_dir = std::getenv("SSL_CERT_DIR");
-        LOG(ERROR) << "[Admin] CA certificate paths: "
-                   << "SSL_CERT_FILE="
+        LOG(ERROR) << "[Admin] CA certificate paths: " << "SSL_CERT_FILE="
                    << (ssl_cert_file ? ssl_cert_file
                                      : "not set (using default)")
                    << ", SSL_CERT_DIR="
@@ -613,7 +803,12 @@ static Status verifyExtensionChecksum(const ExtensionRepoInfo& libRepoInfo,
 
 Status uninstall_extension(const std::string& extension_name) {
   LOG(INFO) << "[Admin] UNINSTALL extension: " << extension_name;
+  RETURN_IF_NOT_OK(validateExtensionName(extension_name));
   std::string extDir = getUserExtensionDir(extension_name);
+  if (!isPathWithinRoot(getExtensionRootDir(), extDir)) {
+    return Status(StatusCode::ERR_INVALID_ARGUMENT,
+                  "Extension path escapes the extension root: " + extDir);
+  }
   std::error_code ec;
   if (!std::filesystem::exists(extDir)) {
     return Status(StatusCode::ERR_IO_ERROR,
@@ -665,6 +860,8 @@ void ExtensionManager::Open(const NeugDBConfig& config) {
           std::string error;
           if (name != canonical_name) {
             error = "Extension directory name must be lowercase";
+          } else if (!extension::isValidExtensionName(name)) {
+            error = "Extension directory name must match [a-z0-9_]{1,64}";
           } else {
             const auto status = std::filesystem::status(library, entry_error);
             if (status.type() == std::filesystem::file_type::not_found) {
@@ -729,6 +926,10 @@ void ExtensionManager::Open(const NeugDBConfig& config) {
 result<ExtensionManager::LoadResult> ExtensionManager::LoadExtension(
     const std::string& extension_name) {
   const auto canonical_name = NormalizeExtensionName(extension_name);
+  if (auto valid = extension::validateExtensionName(canonical_name);
+      !valid.ok()) {
+    RETURN_ERROR(valid);
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   if (loaded_extensions_.contains(canonical_name)) {
     LOG(WARNING) << "[Admin] Extension " << canonical_name
@@ -744,6 +945,16 @@ result<ExtensionManager::LoadResult> ExtensionManager::LoadExtension(
   std::string userExtDir = extension::getUserExtensionDir(canonical_name);
   std::string userLibPath = userExtDir + "/" + fileName;
   if (std::filesystem::exists(userLibPath)) {
+    const auto root = extension::getExtensionRootDir();
+    if (!extension::isPathWithinRoot(root, userLibPath)) {
+      RETURN_ERROR(
+          Status(StatusCode::ERR_INVALID_ARGUMENT,
+                 "Extension path escapes the extension root: " + userLibPath));
+    }
+    if (auto trusted = extension::checkTrustedExtensionPath(root, userLibPath);
+        !trusted.ok()) {
+      RETURN_ERROR(trusted);
+    }
     LOG(INFO) << "[Admin] Loading extension from user install: " << userLibPath;
     // Keep extension dependencies in their own scope to avoid symbol
     // conflicts with other loaded libraries.

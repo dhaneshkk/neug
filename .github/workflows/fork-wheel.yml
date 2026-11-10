@@ -1,0 +1,76 @@
+name: Fork Wheel (security/review-fixes)
+
+# Builds installable Linux x86_64 wheels of this fork (core + the
+# vector_search and fts extensions bundled) and publishes them to the
+# `fork-wheels` GitHub release, so notebooks such as Google Colab can
+# `pip install` the hardened build without compiling NeuG from source.
+
+on:
+  push:
+    branches:
+      - security/review-fixes
+  workflow_dispatch:
+    inputs:
+      python:
+        description: 'cibuildwheel build selector'
+        default: 'cp311-* cp312-*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-wheels:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          df -h /
+
+      - name: Build wheels (manylinux, bundled extensions)
+        env:
+          CIBW_BUILD: ${{ github.event.inputs.python || 'cp311-* cp312-*' }}
+          CIBW_ARCHS_LINUX: x86_64
+          CI_INSTALL_EXTENSIONS: vector_search;fts
+          BUILD_TYPE: RELEASE
+          PYBIND11_FINDPYTHON: 'OFF'
+          NEUG_COMMIT_SHA: ${{ github.sha }}
+          CIBW_TEST_COMMAND: >-
+            python -c "import neug; db=neug.Database(); c=db.connect();
+            print(list(c.execute('RETURN 1')))"
+        run: |
+          set -euo pipefail
+          python -m pip install cibuildwheel==3.4.0 wheel
+          export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+          python -m cibuildwheel ./tools/python_bind --output-dir wheelhouse
+          ls -la wheelhouse
+
+      - name: Publish to the fork-wheels release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fork-wheels
+          name: Hardened fork wheels (security/review-fixes)
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          body: |
+            Linux x86_64 wheels built from `${{ github.sha }}` on
+            `security/review-fixes`, with the `vector_search` and `fts`
+            extensions bundled. Install with
+            `pip install <wheel-url>` (pick the cpXY tag matching your Python).
+          files: wheelhouse/*.whl
+          overwrite_files: true

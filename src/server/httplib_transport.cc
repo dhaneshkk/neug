@@ -122,6 +122,7 @@ void HttplibTransport::RegisterHandlers() {
   // Non-POST requests on the transaction endpoints must answer 405 with an
   // Allow header to match the BRPC contract (asserted in test_db_svc.cc);
   // httplib would otherwise fall through to its default 404.
+  svr->set_payload_max_length(service_http::MaxRequestBodyBytes());
   svr->set_pre_routing_handler([](const httplib::Request& req,
                                   httplib::Response& res) {
     if (req.method != "POST" && (req.path == "/transactions" ||
@@ -129,6 +130,27 @@ void HttplibTransport::RegisterHandlers() {
       res.status = 405;
       res.set_header("Allow", "POST");
       res.set_header("Cache-Control", "no-store");
+      return httplib::Server::HandlerResponse::Handled;
+    }
+    auto header = [&req](const char* name) -> const std::string* {
+      auto it = req.headers.find(name);
+      return it == req.headers.end() ? nullptr : &it->second;
+    };
+    service_http::HttpRequestHeaders view;
+    view.method = req.method;
+    view.origin = header("Origin");
+    view.content_type = header("Content-Type");
+    view.authorization = header("Authorization");
+    view.has_body = !req.body.empty();
+    if (auto rejection = service_http::CheckRequestAdmission(view)) {
+      LOG(WARNING) << "Rejected " << req.method << " " << req.path << ": "
+                   << rejection->message;
+      res.status = rejection->http_code;
+      res.set_header("Cache-Control", "no-store");
+      if (rejection->http_code == 401) {
+        res.set_header("WWW-Authenticate", "Bearer");
+      }
+      res.set_content(rejection->message, "text/plain");
       return httplib::Server::HandlerResponse::Handled;
     }
     return httplib::Server::HandlerResponse::Unhandled;

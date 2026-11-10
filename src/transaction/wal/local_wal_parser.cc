@@ -28,7 +28,10 @@
 #include <filesystem>
 #include <ostream>
 
+#include <glog/logging.h>
+
 #include "neug/transaction/wal/wal.h"
+#include "neug/utils/crc32c.h"
 #include "neug/utils/exception/exception.h"
 #include "neug/utils/io/file/file_utils.h"
 
@@ -80,36 +83,23 @@ void LocalWalParser::open(const std::string& wal_uri) {
     }
 
     fds_.push_back(fd);
+    paths_.push_back(path);
     mmapped_ptrs_.push_back(mmapped_buffer);
     mmapped_size_.push_back(file_size);
   }
 
   insert_wal_list_.resize(4096);
   for (size_t i = 0; i < mmapped_ptrs_.size(); ++i) {
-    char* ptr = static_cast<char*>(mmapped_ptrs_[i]);
-    while (true) {
-      const WalHeader* header = reinterpret_cast<const WalHeader*>(ptr);
-      ptr += sizeof(WalHeader);
-      uint32_t ts = header->timestamp;
-      if (ts == 0) {
-        break;
-      }
-      int length = header->length;
-      if (header->type) {
-        UpdateWalUnit unit;
-        unit.timestamp = ts;
-        unit.ptr = ptr;
-        unit.size = length;
-        update_wal_list_.push_back(unit);
-      } else {
-        if (ts >= insert_wal_list_.size()) {
-          insert_wal_list_.resize(ts + 1);
-        }
-        insert_wal_list_[ts].ptr = ptr;
-        insert_wal_list_[ts].size = length;
-      }
-      ptr += length;
-      last_ts_ = std::max(ts, last_ts_);
+    char* const begin = static_cast<char*>(mmapped_ptrs_[i]);
+    char* const end = begin + mmapped_size_[i];
+    uint32_t first_word = 0;
+    if (mmapped_size_[i] >= sizeof(first_word)) {
+      std::memcpy(&first_word, begin, sizeof(first_word));
+    }
+    if (first_word == kWalFrameMagic) {
+      parseFramedFile(begin, end, paths_[i]);
+    } else {
+      parseLegacyFile(begin, end, paths_[i]);
     }
   }
 
@@ -135,16 +125,117 @@ void LocalWalParser::close() {
 #endif
   }
   fds_.clear();
+  paths_.clear();
   mmapped_ptrs_.clear();
   mmapped_size_.clear();
   update_wal_list_.clear();
   last_ts_ = 0;
 }
 
+bool LocalWalParser::registerRecord(const WalHeader& header, char* payload,
+                                    size_t payload_length,
+                                    const std::string& path) {
+  const uint32_t ts = header.timestamp;
+  if (header.type) {
+    UpdateWalUnit unit;
+    unit.timestamp = ts;
+    unit.ptr = payload;
+    unit.size = payload_length;
+    update_wal_list_.push_back(unit);
+  } else {
+    if (ts >= insert_wal_list_.size()) {
+      insert_wal_list_.resize(static_cast<size_t>(ts) + 1);
+    }
+    insert_wal_list_[ts].ptr = payload;
+    insert_wal_list_[ts].size = payload_length;
+  }
+  last_ts_ = std::max(ts, last_ts_);
+  return true;
+}
+
+void LocalWalParser::parseFramedFile(char* begin, char* end,
+                                     const std::string& path) {
+  char* ptr = begin;
+  size_t records = 0;
+  while (static_cast<size_t>(end - ptr) >= sizeof(WalFrameHeader)) {
+    WalFrameHeader frame;
+    std::memcpy(&frame, ptr, sizeof(frame));
+    if (frame.magic == 0) {
+      break;  // clean end of log (zeroed terminator / preallocated space)
+    }
+    const size_t offset = static_cast<size_t>(ptr - begin);
+    if (frame.magic != kWalFrameMagic) {
+      LOG(WARNING) << "WAL " << path << ": bad frame magic at offset " << offset
+                   << " after " << records
+                   << " records; treating the rest as a torn tail";
+      break;
+    }
+    char* payload = ptr + sizeof(WalFrameHeader);
+    const size_t remaining = static_cast<size_t>(end - payload);
+    if (frame.payload_length < sizeof(WalHeader) ||
+        frame.payload_length > remaining) {
+      LOG(WARNING) << "WAL " << path << ": record at offset " << offset
+                   << " has invalid length " << frame.payload_length
+                   << "; treating the rest as a torn tail";
+      break;
+    }
+    const uint32_t crc = Crc32c::Extend(
+        Crc32c::Compute(&frame.payload_length, sizeof(frame.payload_length)),
+        payload, frame.payload_length);
+    if (crc != frame.crc32c) {
+      LOG(WARNING) << "WAL " << path << ": checksum mismatch at offset "
+                   << offset << " after " << records
+                   << " records; discarding the uncommitted tail";
+      break;
+    }
+    WalHeader header;
+    std::memcpy(&header, payload, sizeof(header));
+    const size_t body_length = frame.payload_length - sizeof(WalHeader);
+    if (header.timestamp == 0 || header.length != body_length) {
+      LOG(ERROR) << "WAL " << path << ": inconsistent record header at offset "
+                 << offset << "; stopping replay of this file";
+      break;
+    }
+    if (!registerRecord(header, payload + sizeof(WalHeader), body_length,
+                        path)) {
+      break;
+    }
+    ++records;
+    ptr = payload + frame.payload_length;
+  }
+}
+
+void LocalWalParser::parseLegacyFile(char* begin, char* end,
+                                     const std::string& path) {
+  // Pre-checksum format: [WalHeader][body]... terminated by a zero header.
+  // It cannot detect torn records, but every access is bounds-checked so a
+  // damaged file stops replay instead of reading past the mapping.
+  char* ptr = begin;
+  while (static_cast<size_t>(end - ptr) >= sizeof(WalHeader)) {
+    WalHeader header;
+    std::memcpy(&header, ptr, sizeof(header));
+    if (header.timestamp == 0) {
+      break;
+    }
+    char* body = ptr + sizeof(WalHeader);
+    const size_t length = header.length;
+    if (length > static_cast<size_t>(end - body)) {
+      LOG(WARNING) << "WAL " << path << ": legacy record at offset "
+                   << (ptr - begin) << " runs past end of file; stopping";
+      break;
+    }
+    if (!registerRecord(header, body, length, path)) {
+      break;
+    }
+    ptr = body + length;
+  }
+}
+
 uint32_t LocalWalParser::last_ts() const { return last_ts_; }
 
 const WalContentUnit& LocalWalParser::get_insert_wal(uint32_t ts) const {
-  return insert_wal_list_[ts];
+  static const WalContentUnit kEmpty{};
+  return ts < insert_wal_list_.size() ? insert_wal_list_[ts] : kEmpty;
 }
 
 const std::vector<UpdateWalUnit>& LocalWalParser::get_update_wals() const {

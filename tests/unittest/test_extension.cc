@@ -206,8 +206,7 @@ TEST_F(ExtensionConfigTest, BuildSettingControlsInstaller) {
   // A file in place of the extension home stops the enabled installer before
   // any network request. The disabled installer must not inspect that path.
   std::ofstream(extension_home_) << "not a directory";
-  for (const auto* query :
-       {"INSTALL gds", "INSTALL gds FROM 'https://example.invalid/repo'"}) {
+  for (const auto* query : {"INSTALL gds"}) {
     SCOPED_TRACE(query);
     auto result = connection_->Query(query);
     ASSERT_FALSE(result);
@@ -256,3 +255,85 @@ TEST_F(ExtensionConfigTest, BuildSettingControlsUninstall) {
               "local contents");
   }
 }
+
+#if !NEUG_LITE
+static int SetEnvVar(const char* name, const char* value) {
+#ifdef _WIN32
+  return _putenv_s(name, value ? value : "");
+#else
+  return value ? setenv(name, value, 1) : unsetenv(name);
+#endif
+}
+
+TEST_F(ExtensionConfigTest, InstallRejectsRepositoryNotOnAllowlist) {
+  ASSERT_EQ(SetEnvVar("NEUG_EXTENSION_REPO_ALLOWLIST", nullptr), 0);
+  auto result =
+      connection_->Query("INSTALL gds FROM 'https://example.invalid/repo/'");
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().error_code(), neug::StatusCode::ERR_PERMISSION);
+  EXPECT_NE(result.error().error_message().find("not allowed"),
+            std::string::npos);
+  // Rejected before touching the filesystem or the network.
+  EXPECT_FALSE(std::filesystem::exists(extension_home_));
+
+  auto plain_http =
+      connection_->Query("INSTALL gds FROM 'http://example.invalid/repo/'");
+  ASSERT_FALSE(plain_http);
+  EXPECT_EQ(plain_http.error().error_code(), neug::StatusCode::ERR_PERMISSION);
+}
+
+TEST_F(ExtensionConfigTest, InstallAllowsListedRepositoryPrefix) {
+  ASSERT_EQ(SetEnvVar("NEUG_EXTENSION_REPO_ALLOWLIST",
+                      "https://mirror.example/, https://example.invalid/"),
+            0);
+  auto result =
+      connection_->Query("INSTALL gds FROM 'https://example.invalid/repo/'");
+  ASSERT_EQ(SetEnvVar("NEUG_EXTENSION_REPO_ALLOWLIST", nullptr), 0);
+  // The allowlist admits the repository; the download itself then fails.
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().error_code(), neug::StatusCode::ERR_IO_ERROR);
+}
+
+TEST_F(ExtensionConfigTest, UninstallRejectsPathTraversal) {
+  const auto victim = root_ / "victim";
+  std::filesystem::create_directories(victim);
+  std::ofstream(victim / "keep.txt") << "precious";
+  std::filesystem::create_directories(extension_home_ / "extension");
+  for (const auto* query :
+       {"UNINSTALL '../../victim'", "UNINSTALL `../../victim`",
+        "UNINSTALL EXTENSION '..'", "UNINSTALL 'a/b'"}) {
+    SCOPED_TRACE(query);
+    auto result = connection_->Query(query);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().error_code(),
+              neug::StatusCode::ERR_INVALID_ARGUMENT);
+  }
+  EXPECT_TRUE(std::filesystem::exists(victim / "keep.txt"));
+  EXPECT_TRUE(std::filesystem::exists(extension_home_ / "extension"));
+}
+
+TEST_F(ExtensionConfigTest, LoadRejectsInvalidName) {
+  for (const auto* query : {"LOAD '../../tmp/evil'", "LOAD 'gds;x'"}) {
+    SCOPED_TRACE(query);
+    auto result = connection_->Query(query);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().error_code(),
+              neug::StatusCode::ERR_INVALID_ARGUMENT);
+  }
+}
+
+#ifndef _WIN32
+TEST_F(ExtensionConfigTest, LoadRefusesWorldWritableExtensionDirectory) {
+  const auto extension_dir = extension_home_ / "extension" / "gds";
+  std::filesystem::create_directories(extension_dir);
+  std::ofstream(extension_dir / "libgds.neug_extension") << "not a library";
+  std::filesystem::permissions(extension_dir, std::filesystem::perms::all,
+                               std::filesystem::perm_options::replace);
+  auto result = connection_->Query("LOAD gds");
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().error_code(), neug::StatusCode::ERR_PERMISSION);
+  EXPECT_NE(result.error().error_message().find("world-writable"),
+            std::string::npos);
+}
+#endif
+#endif  // !NEUG_LITE

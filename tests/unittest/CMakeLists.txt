@@ -34,6 +34,10 @@ add_neug_test(test_column test_column.cc)
 
 add_neug_test(test_explain_profile test_explain_profile.cpp)
 
+add_neug_test(test_http_admission test_http_admission.cc)
+target_include_directories(test_http_admission PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/server)
+
 if (BUILD_HTTP_SERVER)
     if (WIN32)
         # test_http_server drives the BRPC channel and test_db_svc links

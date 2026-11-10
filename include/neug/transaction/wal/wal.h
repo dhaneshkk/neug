@@ -32,11 +32,36 @@
 
 namespace neug {
 
+// Logical record header embedded at the start of every WAL payload.
+//
+// Both bit-fields share one uint32_t storage unit so that GCC, Clang and MSVC
+// agree on an 8-byte layout (bit 0 = type, bits 1..31 = length). The previous
+// mix of uint8_t/int32_t bit-fields produced a 12-byte header on MSVC and a
+// signed 31-bit length that silently went negative above 1 GiB.
 struct WalHeader {
   uint32_t timestamp;
-  uint8_t type : 1;
-  int32_t length : 31;
+  uint32_t type : 1;
+  uint32_t length : 31;
 };
+static_assert(sizeof(WalHeader) == 8, "WalHeader must be 8 bytes on all ABIs");
+
+// Largest payload (excluding WalHeader) a single WAL record can describe.
+inline constexpr size_t kWalMaxRecordLength = (size_t{1} << 31) - 1;
+
+// On-disk integrity frame written by LocalWalWriter around each record:
+//   [WalFrameHeader][payload = WalHeader + body]
+// The CRC-32C covers payload_length and the payload, so recovery can detect a
+// torn tail (crash between write and fsync) or bit-rot and stop replay at the
+// last intact record instead of deserializing garbage.
+struct WalFrameHeader {
+  uint32_t magic;
+  uint32_t payload_length;
+  uint32_t crc32c;
+  uint32_t reserved;
+};
+static_assert(sizeof(WalFrameHeader) == 16, "WalFrameHeader must be 16 bytes");
+
+inline constexpr uint32_t kWalFrameMagic = 0x324C574Eu;  // "NWL2"
 
 struct WalContentUnit {
   char* ptr{NULL};

@@ -351,19 +351,21 @@ TEST_F(LocalWalParserTest, WriterPersistsTerminatorAfterEachAppend) {
     std::ifstream wal(wal_path, std::ios::binary);
     ASSERT_TRUE(wal);
     wal.seekg(static_cast<std::streamoff>(offset));
-    neug::WalHeader terminator;
+    neug::WalFrameHeader terminator;
     wal.read(reinterpret_cast<char*>(&terminator), sizeof(terminator));
     ASSERT_TRUE(wal);
-    EXPECT_EQ(terminator.timestamp, 0u);
-    EXPECT_EQ(terminator.type, 0u);
-    EXPECT_EQ(terminator.length, 0);
+    EXPECT_EQ(terminator.magic, 0u);
+    EXPECT_EQ(terminator.payload_length, 0u);
+    EXPECT_EQ(terminator.crc32c, 0u);
   };
-  expect_terminator_at(first_record.size());
+  // Each record is framed as [WalFrameHeader][record].
+  constexpr size_t kFrame = sizeof(neug::WalFrameHeader);
+  expect_terminator_at(kFrame + first_record.size());
 
   std::vector<char> second_record;
   AppendWalEntry(second_record, 2, 0, "second");
   ASSERT_TRUE(writer.append(second_record.data(), second_record.size()));
-  expect_terminator_at(first_record.size() + second_record.size());
+  expect_terminator_at(2 * kFrame + first_record.size() + second_record.size());
   writer.close();
 
   neug::LocalWalParser parser(wal_dir_);

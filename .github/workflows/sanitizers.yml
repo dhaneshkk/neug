@@ -1,0 +1,59 @@
+name: NeuG Sanitizers (ASan + UBSan)
+
+# Runs the storage/transaction/WAL and service-hardening unit tests under
+# AddressSanitizer and UndefinedBehaviorSanitizer. The CMake options already
+# existed but no workflow enabled them.
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - src/**
+      - include/**
+      - tests/**
+      - CMakeLists.txt
+      - .github/workflows/sanitizers.yml
+  schedule:
+    - cron: 0 18 * * 3
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  asan-ubsan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    env:
+      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:strict_string_checks=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libssl-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TEST=ON -DBUILD_PYTHON=OFF \
+            -DENABLE_ADDRESS_SANITIZER=ON -DENABLE_UBSAN=ON
+
+      - name: Build sanitizer test targets
+        run: |
+          cmake --build build -j"$(nproc)" --target \
+            wal_integrity_test test_http_admission test_extension
+
+      - name: Run tests
+        run: |
+          ./build/tests/transaction/wal_integrity_test
+          ./build/tests/unittest/test_http_admission
+          ./build/tests/unittest/test_extension --gtest_filter='ExtensionConfigTest.*'

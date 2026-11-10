@@ -41,7 +41,13 @@ class LocalWalParser : public IWalParser {
   const std::vector<UpdateWalUnit>& get_update_wals() const override;
 
  private:
+  void parseFramedFile(char* begin, char* end, const std::string& path);
+  void parseLegacyFile(char* begin, char* end, const std::string& path);
+  bool registerRecord(const WalHeader& header, char* payload,
+                      size_t payload_length, const std::string& path);
+
   std::vector<int> fds_;
+  std::vector<std::string> paths_;
   std::vector<void*> mmapped_ptrs_;
   std::vector<size_t> mmapped_size_;
   std::vector<WalContentUnit> insert_wal_list_;

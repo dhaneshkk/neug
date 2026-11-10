@@ -28,12 +28,14 @@
 #endif
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <limits>
 #include <ostream>
 
 #include "neug/transaction/wal/wal.h"
+#include "neug/utils/crc32c.h"
 #include "neug/utils/io/file/file_utils.h"
 #include "neug/utils/likely.h"
 
@@ -88,6 +90,8 @@ void LocalWalWriter::open(const std::string& wal_uri) {
 void LocalWalWriter::create_file() {
   const auto prefix = get_wal_uri_path(wal_uri_);
   const int max_version = 65536;
+  fd_ = -1;
+  errno = EEXIST;
   for (int version = 0; version != max_version; ++version) {
     // Keep the historical on-disk prefix for WAL replay compatibility. The
     // numeric component now identifies a logical execution slot, not a
@@ -97,14 +101,20 @@ void LocalWalWriter::create_file() {
     if (std::filesystem::exists(path)) {
       continue;
     }
+    // O_EXCL: never truncate a WAL file that appeared after the exists()
+    // check (e.g. another opener racing on the same directory). On EEXIST we
+    // simply try the next version.
 #ifdef _WIN32
     // WAL records contain arbitrary bytes. Text mode expands LF to CRLF,
     // invalidating serialized lengths and the offsets used by write_all_at.
-    fd_ = _open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | _O_BINARY,
+    fd_ = _open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | _O_BINARY,
                 _S_IREAD | _S_IWRITE);
 #else
-    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
 #endif
+    if (fd_ == -1 && errno == EEXIST) {
+      continue;
+    }
     break;
   }
   if (fd_ == -1) {
@@ -208,6 +218,26 @@ bool LocalWalWriter::append(const char* data, size_t length) {
   if (length == 0) {
     return true;
   }
+  // Validate before touching the file: a record whose embedded length does not
+  // match (e.g. a >2 GiB redo that overflowed the 31-bit length field) would be
+  // unreplayable, so reject it while the transaction can still abort cleanly.
+  if (length < sizeof(WalHeader) ||
+      length - sizeof(WalHeader) > kWalMaxRecordLength) {
+    LOG(ERROR) << "Rejecting WAL record of " << length
+               << " bytes: exceeds the maximum record size of "
+               << kWalMaxRecordLength << " bytes";
+    return false;
+  }
+  {
+    WalHeader header;
+    std::memcpy(&header, data, sizeof(header));
+    if (header.length != length - sizeof(WalHeader)) {
+      LOG(ERROR) << "Rejecting malformed WAL record: header length "
+                 << header.length << " != payload length "
+                 << (length - sizeof(WalHeader));
+      return false;
+    }
+  }
   if (fd_ == -1) {
     try {
       create_file();
@@ -220,7 +250,9 @@ bool LocalWalWriter::append(const char* data, size_t length) {
       return false;
     }
   }
-  const size_t expected_size = file_used_ + length + sizeof(WalHeader);
+  // frame header + payload + zeroed terminator frame
+  const size_t expected_size =
+      file_used_ + sizeof(WalFrameHeader) + length + sizeof(WalFrameHeader);
   if (expected_size > file_size_) {
     size_t new_file_size = (expected_size / TRUNC_SIZE + 1) * TRUNC_SIZE;
 #ifdef _WIN32
@@ -237,10 +269,18 @@ bool LocalWalWriter::append(const char* data, size_t length) {
     file_size_ = new_file_size;
   }
 
-  write_all_at(data, length, file_used_);
-  const WalHeader terminator{};
+  WalFrameHeader frame{};
+  frame.magic = kWalFrameMagic;
+  frame.payload_length = static_cast<uint32_t>(length);
+  frame.crc32c = Crc32c::Extend(
+      Crc32c::Compute(&frame.payload_length, sizeof(frame.payload_length)),
+      data, length);
+  write_all_at(reinterpret_cast<const char*>(&frame), sizeof(frame),
+               file_used_);
+  write_all_at(data, length, file_used_ + sizeof(frame));
+  const WalFrameHeader terminator{};
   write_all_at(reinterpret_cast<const char*>(&terminator), sizeof(terminator),
-               file_used_ + length);
+               file_used_ + sizeof(frame) + length);
 
 #ifdef _WIN32
   if (_commit(fd_) != 0) {
@@ -255,7 +295,7 @@ bool LocalWalWriter::append(const char* data, size_t length) {
     retire_after_append_failure("Failed to sync WAL file", errno);
   }
 #endif
-  file_used_ += length;
+  file_used_ += sizeof(WalFrameHeader) + length;
   return true;
 }
 

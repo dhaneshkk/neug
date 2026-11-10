@@ -588,15 +588,14 @@ class NeugShell(cmd.Cmd):
 
         except ImportError as e:
             click.echo(f"Error: Flask dependencies not installed. {e}")
-            click.echo("Please install with: pip install flask flask-cors")
+            click.echo("Please install with: pip install flask")
         except Exception as e:
             click.echo(f"Error starting web UI: {e}")
         return
 
     def do_help(self, arg):
         """Provide usage hints."""
-        print(
-            """
+        print("""
             Usage hints:
             - Enter Cypher queries directly to execute them on the connected database.
             - Use :help to display this help message.
@@ -606,8 +605,7 @@ class NeugShell(cmd.Cmd):
             - Multi-line commands are supported. Use ';' at the end to execute.
             - Command history is supported; use the up/down arrow keys to navigate previous commands.
             - Use Tab to cycle candidates and right arrow to accept the current suggestion.
-            """
-        )
+            """)
 
 
 @click.group(

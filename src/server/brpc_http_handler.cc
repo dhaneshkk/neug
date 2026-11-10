@@ -85,6 +85,34 @@ void FinishTransaction(brpc::Controller* cntl, Operation&& operation) {
   SendHttpResponse(cntl, response);
 }
 
+// Returns true (and fills the response) when the request must be refused.
+bool RejectInadmissible(brpc::Controller* cntl) {
+  const auto& http = cntl->http_request();
+  service_http::HttpRequestHeaders view;
+  const std::string method =
+      http.method() == brpc::HTTP_METHOD_POST
+          ? "POST"
+          : (http.method() == brpc::HTTP_METHOD_GET ? "GET" : "OTHER");
+  view.method = method;
+  view.origin = http.GetHeader("Origin");
+  const std::string& content_type = http.content_type();
+  view.content_type = content_type.empty() ? nullptr : &content_type;
+  view.authorization = http.GetHeader("Authorization");
+  view.has_body = !cntl->request_attachment().empty();
+  auto rejection = service_http::CheckRequestAdmission(view);
+  if (!rejection) {
+    return false;
+  }
+  LOG(WARNING) << "Rejected request: " << rejection->message;
+  cntl->SetFailed(rejection->http_code, "%s", rejection->message.c_str());
+  cntl->http_response().set_status_code(rejection->http_code);
+  cntl->http_response().SetHeader("Cache-Control", "no-store");
+  if (rejection->http_code == 401) {
+    cntl->http_response().SetHeader("WWW-Authenticate", "Bearer");
+  }
+  return true;
+}
+
 }  // namespace
 
 void BrpcHttpHandler::PostCypherQuery(
@@ -92,6 +120,9 @@ void BrpcHttpHandler::PostCypherQuery(
     HttpResponse*, google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   auto* cntl = static_cast<brpc::Controller*>(cntl_base);
+  if (RejectInadmissible(cntl)) {
+    return;
+  }
   const auto query_request = cntl->request_attachment().to_string();
   if (query_request.empty()) {
     result<std::string> error = tl::unexpected(
@@ -112,6 +143,9 @@ void BrpcHttpHandler::GetSchema(google::protobuf::RpcController* cntl_base,
                                 google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+  if (RejectInadmissible(cntl)) {
+    return;
+  }
   auto ret = tp_operations_.GetSchema();
 
   SendHttpResponse(cntl, ret);
@@ -122,6 +156,9 @@ void BrpcHttpHandler::GetServiceStatus(
     HttpResponse* response, google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+  if (RejectInadmissible(cntl)) {
+    return;
+  }
   auto ret = tp_operations_.GetServiceStatus();
 
   SendHttpResponse(cntl, ret);
@@ -132,6 +169,9 @@ void BrpcHttpHandler::BeginTransaction(
     HttpResponse*, google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   auto* cntl = static_cast<brpc::Controller*>(cntl_base);
+  if (RejectInadmissible(cntl)) {
+    return;
+  }
   MarkTransactionResponse(cntl);
   if (!RequireHttpMethod(cntl, brpc::HTTP_METHOD_POST, "POST")) {
     return;
@@ -163,6 +203,9 @@ void BrpcHttpHandler::ExecuteTransactionQuery(
     HttpResponse*, google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   auto* cntl = static_cast<brpc::Controller*>(cntl_base);
+  if (RejectInadmissible(cntl)) {
+    return;
+  }
   MarkTransactionResponse(cntl);
   if (!RequireHttpMethod(cntl, brpc::HTTP_METHOD_POST, "POST")) {
     return;
@@ -192,6 +235,9 @@ void BrpcHttpHandler::CommitTransaction(
     HttpResponse*, google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   auto* cntl = static_cast<brpc::Controller*>(cntl_base);
+  if (RejectInadmissible(cntl)) {
+    return;
+  }
   FinishTransaction(cntl, [this](std::string_view transaction_id) {
     return tp_operations_.CommitTransaction(transaction_id);
   });
@@ -202,6 +248,9 @@ void BrpcHttpHandler::RollbackTransaction(
     HttpResponse*, google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   auto* cntl = static_cast<brpc::Controller*>(cntl_base);
+  if (RejectInadmissible(cntl)) {
+    return;
+  }
   FinishTransaction(cntl, [this](std::string_view transaction_id) {
     return tp_operations_.RollbackTransaction(transaction_id);
   });

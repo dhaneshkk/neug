@@ -26,7 +26,6 @@ from flask import Flask
 from flask import jsonify
 from flask import request
 from flask import send_from_directory
-from flask_cors import CORS
 
 from neug.connection import Connection
 from neug.database import Database
@@ -39,7 +38,10 @@ logger = logging.getLogger("neug")
 class NeugWebUI:
     def __init__(self, db=None, connection=None, host="127.0.0.1", port=5000):
         self.app = Flask(__name__)
-        CORS(self.app)  # Enable CORS for all routes
+        # The UI page is served from this same origin, so no CORS is needed.
+        # A wildcard CORS policy let any website the user visited run Cypher
+        # against the local database and read the results.
+        self.app.before_request(self._reject_cross_origin)
 
         self.db = db
         self.host = host
@@ -53,6 +55,30 @@ class NeugWebUI:
         # Initialize database connection if db is provided
         if self.db is not None:
             self._init_database()
+
+    @staticmethod
+    def _reject_cross_origin():
+        """Refuse requests forged by other web origins (CSRF/DNS rebinding).
+
+        Browsers attach an ``Origin`` header to cross-origin requests and to
+        every POST. Accept it only when it matches this server's own origin or
+        an entry of ``NEUG_UI_ALLOWED_ORIGINS`` (comma-separated). Non-browser
+        clients such as curl or ``requests`` send no Origin and are unaffected.
+        """
+        origin = request.headers.get("Origin")
+        if not origin:
+            return None
+        origin = origin.rstrip("/").lower()
+        own = request.host_url.rstrip("/").lower()
+        extra = {
+            o.strip().rstrip("/").lower()
+            for o in os.environ.get("NEUG_UI_ALLOWED_ORIGINS", "").split(",")
+            if o.strip()
+        }
+        if origin == own or origin in extra:
+            return None
+        logger.warning("Rejected cross-origin request from %s", origin)
+        return "Cross-origin request rejected", 403
 
     def _setup_routes(self):
         """Setup Flask routes"""
@@ -73,7 +99,7 @@ class NeugWebUI:
         def execute_query():
             # Get raw string from request body
             query = request.get_data(as_text=True)
-            logger.info(f"Received query: {query}")
+            logger.debug("Received query of %d bytes", len(query))
             try:
                 return self.session.execute(query).get_bolt_response()
             except Exception as e:

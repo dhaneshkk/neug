@@ -18,6 +18,8 @@
 
 import json
 import logging
+import os
+from typing import Optional
 
 import requests
 import requests.adapters
@@ -26,8 +28,6 @@ try:
     from neug_py_bind import PyQueryRequest
     from neug_py_bind import PyQueryResult
 except ImportError as e:
-    import os
-
     if os.environ.get("BUILD_DOC", "OFF") == "OFF":
         # re-raise the import error if building documentation
         raise e
@@ -75,12 +75,15 @@ class Session:
         endpoint: str = "http://localhost:10000",
         timeout: str = "10s",
         num_threads: int = 1,
+        auth_token: Optional[str] = None,
     ):
         """
         Initialize a session with the given endpoint and timeout.
 
         :param endpoint: The endpoint URL for the session.
         :param timeout: The timeout duration for the session.
+        :param auth_token: Bearer token for a server started with
+            ``NEUG_HTTP_AUTH_TOKEN``. Defaults to that environment variable.
         """
         self._endpoint = endpoint
         self._query_endpoint = endpoint + "/cypher"
@@ -91,6 +94,14 @@ class Session:
         if isinstance(self._timeout, int):
             self._timeout = f"{self._timeout}s"
         self._http_session = requests.Session()
+        self._http_session.headers["Content-Type"] = "application/json"
+        token = (
+            auth_token
+            if auth_token is not None
+            else os.environ.get("NEUG_HTTP_AUTH_TOKEN")
+        )
+        if token:
+            self._http_session.headers["Authorization"] = f"Bearer {token}"
         self._http_adapter = requests.adapters.HTTPAdapter(
             pool_connections=num_threads,
             pool_maxsize=num_threads,

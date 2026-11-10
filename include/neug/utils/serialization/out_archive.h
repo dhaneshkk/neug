@@ -14,6 +14,8 @@ limitations under the License.
 */
 #pragma once
 
+#include <cstring>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -82,7 +84,24 @@ class OutArchive {
 
   inline bool Empty() const { return begin_ == end_; }
 
+  /// Bytes left to read.
+  inline size_t Remaining() const { return static_cast<size_t>(end_ - begin_); }
+
+  /// Fail with std::out_of_range when fewer than `size` bytes remain.
+  /// Serialized data (WAL records, checkpoints, wire payloads) may be
+  /// truncated or corrupted; an unchecked cursor would read past the buffer
+  /// and turn a recoverable error into a crash.
+  inline void Require(size_t size) const {
+    if (size > Remaining()) {
+      throw std::out_of_range(
+          "OutArchive: truncated or corrupted input (need " +
+          std::to_string(size) + " bytes, " + std::to_string(Remaining()) +
+          " remaining)");
+    }
+  }
+
   inline void* GetBytes(size_t size) {
+    Require(size);
     char* ret = begin_;
     begin_ += size;
     return ret;
@@ -115,8 +134,10 @@ inline OutArchive& operator>>(OutArchive& out_archive, EmptyType&) {
 inline OutArchive& operator>>(OutArchive& out_archive, std::string& s) {
   size_t size;
   out_archive >> size;
-  s.resize(size);
-  memcpy(&s[0], out_archive.GetBytes(size), size);
+  // Bounds-check before allocating so a corrupted length cannot request an
+  // arbitrarily large buffer.
+  const char* data = static_cast<const char*>(out_archive.GetBytes(size));
+  s.assign(data, size);
   return out_archive;
 }
 
@@ -133,6 +154,9 @@ template <typename T,
 inline OutArchive& operator>>(OutArchive& out_archive, std::vector<T>& vec) {
   size_t size;
   out_archive >> size;
+  if (size > out_archive.Remaining() / sizeof(T)) {
+    out_archive.Require(static_cast<size_t>(-1));  // throws: corrupt count
+  }
   vec.resize(size);
   if (size > 0) {
     if constexpr (std::is_same_v<T, bool>) {
@@ -154,6 +178,11 @@ template <typename T,
 inline OutArchive& operator>>(OutArchive& out_archive, std::vector<T>& vec) {
   size_t size;
   out_archive >> size;
+  // Every element consumes at least one byte, so a count larger than the
+  // remaining input is necessarily corrupt.
+  if (size > out_archive.Remaining()) {
+    out_archive.Require(size);
+  }
   vec.resize(size);
   for (size_t i = 0; i < size; ++i) {
     out_archive >> vec[i];
