@@ -21,11 +21,16 @@ namespace neug {
 
 WalBuilder::WalBuilder() { arc_.Resize(sizeof(WalHeader)); }
 
-void WalBuilder::finalize(timestamp_t timestamp) {
+bool WalBuilder::finalize(timestamp_t timestamp) {
+  const size_t body_length = arc_.GetSize() - sizeof(WalHeader);
+  if (!WalPayloadFits(body_length)) {
+    return false;
+  }
   auto* header = reinterpret_cast<WalHeader*>(arc_.GetBuffer());
-  header->length = arc_.GetSize() - sizeof(WalHeader);
+  header->length = static_cast<uint32_t>(body_length);
   header->type = 1;
   header->timestamp = timestamp;
+  return true;
 }
 
 void WalBuilder::clear() {

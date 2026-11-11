@@ -99,7 +99,9 @@ class WalBuilder {
   size_t content_size() const { return arc_.GetSize() - sizeof(WalHeader); }
 
   /// Finalize the WAL header. Call only when op_num() > 0.
-  void finalize(timestamp_t timestamp);
+  // Fills in the record header. Returns false (header untouched) when the
+  // redo body is too large for one WAL record; the caller must abort.
+  [[nodiscard]] bool finalize(timestamp_t timestamp);
 
   /// Full buffer (header + content) after finalize().
   char* data() { return arc_.GetBuffer(); }

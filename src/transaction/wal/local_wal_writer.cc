@@ -218,25 +218,14 @@ bool LocalWalWriter::append(const char* data, size_t length) {
   if (length == 0) {
     return true;
   }
-  // Validate before touching the file: a record whose embedded length does not
-  // match (e.g. a >2 GiB redo that overflowed the 31-bit length field) would be
-  // unreplayable, so reject it while the transaction can still abort cleanly.
-  if (length < sizeof(WalHeader) ||
-      length - sizeof(WalHeader) > kWalMaxRecordLength) {
-    LOG(ERROR) << "Rejecting WAL record of " << length
-               << " bytes: exceeds the maximum record size of "
-               << kWalMaxRecordLength << " bytes";
+  // The frame stores the payload length in 32 bits. Reject anything larger
+  // before touching the file so the caller can still abort cleanly. Record
+  // producers separately enforce the tighter WalHeader limit (WalPayloadFits),
+  // and recovery re-validates the embedded header against the frame.
+  if (length > std::numeric_limits<uint32_t>::max()) {
+    LOG(ERROR) << "Rejecting WAL payload of " << length
+               << " bytes: exceeds the 32-bit frame length limit";
     return false;
-  }
-  {
-    WalHeader header;
-    std::memcpy(&header, data, sizeof(header));
-    if (header.length != length - sizeof(WalHeader)) {
-      LOG(ERROR) << "Rejecting malformed WAL record: header length "
-                 << header.length << " != payload length "
-                 << (length - sizeof(WalHeader));
-      return false;
-    }
   }
   if (fd_ == -1) {
     try {

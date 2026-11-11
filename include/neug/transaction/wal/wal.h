@@ -48,6 +48,13 @@ static_assert(sizeof(WalHeader) == 8, "WalHeader must be 8 bytes on all ABIs");
 // Largest payload (excluding WalHeader) a single WAL record can describe.
 inline constexpr size_t kWalMaxRecordLength = (size_t{1} << 31) - 1;
 
+// True when a record body of this size can be described by WalHeader::length.
+// Record producers check this before appending so an oversized transaction
+// aborts cleanly instead of writing a header whose length has wrapped.
+inline constexpr bool WalPayloadFits(size_t body_length) {
+  return body_length <= kWalMaxRecordLength;
+}
+
 // On-disk integrity frame written by LocalWalWriter around each record:
 //   [WalFrameHeader][payload = WalHeader + body]
 // The CRC-32C covers payload_length and the payload, so recovery can detect a

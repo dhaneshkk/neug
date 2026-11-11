@@ -80,7 +80,12 @@ Status CurrentCowWriteTransaction::Commit() {
     return prepare_status;
   }
 
-  logical_redo.finalize(timestamp());
+  if (!logical_redo.finalize(timestamp())) {
+    Abort();
+    return Status(StatusCode::ERR_INVALID_ARGUMENT,
+                  "Transaction redo log exceeds the maximum WAL record size (2 "
+                  "GiB); split the write into smaller transactions");
+  }
 
   // Redo contains only persistent mutations. Publish the whole workspace
   // after WAL append so temporary and persistent changes become visible once.

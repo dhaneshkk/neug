@@ -26,6 +26,7 @@
 #include "neug/transaction/timestamp_lease.h"
 #include "neug/transaction/version_manager.h"
 #include "neug/transaction/wal/wal.h"
+#include "neug/utils/crc32c.h"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -100,8 +101,18 @@ TEST(WalWriterTest, ReopensSameInstanceOnNewTimeline) {
     const auto end = std::filesystem::directory_iterator();
     EXPECT_NE(begin, end);
     std::ifstream wal_file(begin->path(), std::ios::binary);
+    // Each record is wrapped in an integrity frame; the payload follows it.
+    neug::WalFrameHeader frame{};
+    wal_file.read(reinterpret_cast<char*>(&frame), sizeof(frame));
+    EXPECT_EQ(frame.magic, neug::kWalFrameMagic);
+    EXPECT_EQ(frame.payload_length, sizeof(uint32_t));
     uint32_t marker = 0;
     wal_file.read(reinterpret_cast<char*>(&marker), sizeof(marker));
+    EXPECT_EQ(frame.crc32c,
+              neug::Crc32c::Extend(
+                  neug::Crc32c::Compute(&frame.payload_length,
+                                        sizeof(frame.payload_length)),
+                  &marker, sizeof(marker)));
     return marker;
   };
   EXPECT_EQ(read_marker(old_wal_dir), old_marker);

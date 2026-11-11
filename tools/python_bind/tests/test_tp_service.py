@@ -1359,7 +1359,13 @@ def test_tp_checkpoint_rotates_wal_and_resets_timeline(tmp_path, unused_tcp_port
         first_timestamps = []
         for wal_path in current_wals:
             with wal_path.open("rb") as wal_file:
-                first_timestamps.append(int.from_bytes(wal_file.read(4), "little"))
+                head = wal_file.read(4)
+                # Records are wrapped in a 16-byte integrity frame ("NWL2" magic,
+                # length, CRC-32C, reserved); the WalHeader timestamp follows it.
+                if int.from_bytes(head, "little") == 0x324C574E:
+                    wal_file.read(12)
+                    head = wal_file.read(4)
+                first_timestamps.append(int.from_bytes(head, "little"))
         assert first_timestamps == [1]
     finally:
         if session is not None:

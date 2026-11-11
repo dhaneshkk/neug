@@ -86,7 +86,12 @@ Status SnapshotCowWriteTransaction::PrepareCommit() {
     Abort();
     return prepared_result.error();
   }
-  logical_redo.finalize(timestamp());
+  if (!logical_redo.finalize(timestamp())) {
+    Abort();
+    return Status(StatusCode::ERR_INVALID_ARGUMENT,
+                  "Transaction redo log exceeds the maximum WAL record size (2 "
+                  "GiB); split the write into smaller transactions");
+  }
   prepared_snapshot_.emplace(std::move(prepared_result).value());
   return Status::OK();
 }

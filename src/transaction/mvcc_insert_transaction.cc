@@ -168,8 +168,14 @@ bool MvccInsertTransaction::Commit() {
     clear();
     return true;
   }
+  if (!WalPayloadFits(arc_.GetSize() - sizeof(WalHeader))) {
+    LOG(ERROR) << "Insert transaction redo log of " << arc_.GetSize()
+               << " bytes exceeds the maximum WAL record size";
+    Abort();
+    return false;
+  }
   auto* header = reinterpret_cast<WalHeader*>(arc_.GetBuffer());
-  header->length = arc_.GetSize() - sizeof(WalHeader);
+  header->length = static_cast<uint32_t>(arc_.GetSize() - sizeof(WalHeader));
   header->type = 0;
   header->timestamp = timestamp_;
 

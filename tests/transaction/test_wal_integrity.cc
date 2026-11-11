@@ -151,18 +151,49 @@ TEST_F(WalIntegrityTest, CorruptLengthDoesNotReadPastMapping) {
   EXPECT_EQ(parser.last_ts(), 1u);
 }
 
-TEST_F(WalIntegrityTest, WriterRejectsMismatchedHeaderLength) {
-  auto record = MakeRecord(1, 0, "payload");
+TEST_F(WalIntegrityTest, MismatchedHeaderLengthIsRejectedAtRecovery) {
+  // The writer frames any payload; a record whose embedded WalHeader length
+  // disagrees with the frame must never be replayed.
+  auto good = MakeRecord(1, 0, "ok");
+  auto record = MakeRecord(2, 0, "payload");
   neug::WalHeader bad{};
-  bad.timestamp = 1;
+  bad.timestamp = 2;
   bad.length = 1000;  // does not match the actual body size
   std::memcpy(record.data(), &bad, sizeof(bad));
-  neug::LocalWalWriter writer(dir_.string(), 0);
-  writer.open(dir_.string());
-  EXPECT_FALSE(writer.append(record.data(), record.size()));
-  // Rejected before any file was created, so the transaction can abort.
-  EXPECT_TRUE(std::filesystem::is_empty(dir_));
-  writer.close();
+  {
+    neug::LocalWalWriter writer(dir_.string(), 0);
+    writer.open(dir_.string());
+    ASSERT_TRUE(writer.append(good.data(), good.size()));
+    ASSERT_TRUE(writer.append(record.data(), record.size()));
+    writer.close();
+  }
+  neug::LocalWalParser parser(dir_.string());
+  EXPECT_EQ(parser.last_ts(), 1u);
+  EXPECT_EQ(parser.get_insert_wal(2).size, 0u);
+}
+
+TEST(WalLimitsTest, OversizedPayloadsAreRejectedBeforeWriting) {
+  EXPECT_TRUE(neug::WalPayloadFits(0));
+  EXPECT_TRUE(neug::WalPayloadFits(neug::kWalMaxRecordLength));
+  EXPECT_FALSE(neug::WalPayloadFits(neug::kWalMaxRecordLength + 1));
+
+  const auto dir =
+      std::filesystem::temp_directory_path() /
+      ("neug_wal_limit_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  {
+    neug::LocalWalWriter writer(dir.string(), 0);
+    writer.open(dir.string());
+    char byte = 0;
+    // The length is validated before the buffer is read or a file is created.
+    EXPECT_FALSE(writer.append(&byte, size_t{1} << 33));
+    EXPECT_TRUE(std::filesystem::is_empty(dir));
+    writer.close();
+  }
+  std::filesystem::remove_all(dir);
 }
 
 TEST_F(WalIntegrityTest, LegacyUnframedFilesStillReplay) {
