@@ -20,8 +20,20 @@ A single-cell notebook that installs this fork's wheel from the
    scored with MCC.
 
 Text encoders are trained with Sharpness-Aware Minimization (numpy, no GPU needed).
-Set `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` (env vars or Colab secrets)
-to use an OpenAI-compatible `/chat/completions` endpoint for the STOP-WORK brief and
-memory answers. Without them, the notebook uses offline fallbacks.
+
+**LLM (Google Gemini by default).** Add a `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) Colab
+secret from [Google AI Studio](https://aistudio.google.com/apikey). The notebook calls
+Gemini's OpenAI-compatible endpoint `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`:
+- **Model:** it picks the newest stable `gemini-X.Y-flash` listed by `/models`. To pin a
+  model, set `CFG["LLM_MODEL"]` or an `LLM_MODEL` secret.
+- **Parameters:** it sends `reasoning_effort` and leaves out `temperature`/`top_p`
+  (newer Gemini models ignore or reject them).
+- **Rate limits:** it retries on HTTP 429/5xx.
+
+The LLM writes the STOP-WORK brief and the memory answer. Set
+`CFG["LLM_EXTRACT_PER_EPISODE"]=True` to also use it for entity extraction (about 220
+calls, which can hit free-tier limits). To use another OpenAI-compatible server instead,
+set `CFG["LLM_PROVIDER"]="openai"` plus an `OPENAI_API_KEY` and an optional
+`LLM_BASE_URL`. With no key, the notebook uses offline fallbacks.
 
 All data is synthetic.
